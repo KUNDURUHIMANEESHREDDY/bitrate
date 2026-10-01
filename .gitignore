@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+.venv/
+
+# Build output
+web/dist/
+release/
+
+# Runtime state
+data/
+downloads/
+
+# yt-dlp writes fragment files into the working directory if a job is
+# interrupted before the output template takes effect.
+*.m4s
+init-stream*.m4s
+chunk-stream*.m4s
+*-init.mp4
+
+# Logs and editor noise
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Cookies exported from a browser are credentials. Never commit them.
+cookies.txt

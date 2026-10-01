@@ -1,0 +1,49 @@
+{
+  "name": "bitrate",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted video and audio downloader with a local web UI. Passthrough-first, parallel-fragment downloading.",
+  "author": "Bitrate contributors",
+  "type": "module",
+  "license": "MIT",
+  "main": "desktop/main.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "node server/index.js",
+    "dev:web": "npm --prefix web run dev",
+    "build": "npm --prefix web install && npm --prefix web run build",
+    "start": "node server/index.js",
+    "setup": "node scripts/setup.js",
+    "doctor": "node scripts/doctor.js",
+    "idm": "node scripts/idm.js",
+    "icon": "node desktop/make-icon.js",
+    "test": "node test/tray-menu.test.mjs && node test/close.test.mjs && node test/engine.test.mjs && node test/ingest-validate.test.mjs && node test/trace.test.mjs && node test/resume.test.mjs",
+    "test:trace": "node test/trace-download.test.mjs",
+    "test:trace:verify": "node test/trace-verify.mjs",
+    "eval": "node test/eval.mjs",
+    "eval:ytdlp": "node test/eval-ytdlp.mjs",
+    "eval:all": "node test/eval.mjs && node test/eval-ytdlp.mjs",
+    "eval:live": "node test/eval.mjs --live",
+    "desktop": "npm run build && electron .",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@fastify/static": "^8.0.4",
+    "fastify": "^5.2.1"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true
+  },
+  "optionalDependencies": {
+    "@langfuse/otel": "^5.11.1",
+    "@langfuse/tracing": "^5.11.1",
+    "@opentelemetry/sdk-node": "^0.222.0"
+  }
+}

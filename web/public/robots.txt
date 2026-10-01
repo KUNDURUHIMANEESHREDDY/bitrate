@@ -1,0 +1,3 @@
+# Bitrate is a private, loopback-only tool. It should never be indexed.
+User-agent: *
+Disallow: /

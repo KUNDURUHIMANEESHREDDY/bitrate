@@ -1,0 +1,141 @@
+@import 'tailwindcss';
+
+@import '@fontsource-variable/geist/index.css';
+@import '@fontsource-variable/geist-mono/index.css';
+
+/*
+  One theme, locked. Light and dark are two values of the same set of tokens,
+  so no surface ever inverts mid-page. Neutrals are zinc, the single accent is
+  emerald, and nothing is ever pure black or pure white.
+*/
+@theme {
+  --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'Geist Mono Variable', ui-monospace, monospace;
+
+  --color-accent-50: oklch(0.96 0.04 165);
+  --color-accent-200: oklch(0.85 0.11 165);
+  --color-accent-400: oklch(0.74 0.15 164);
+  --color-accent-500: oklch(0.68 0.15 163);
+  --color-accent-600: oklch(0.58 0.13 163);
+  --color-accent-700: oklch(0.49 0.10 163);
+  --color-accent-900: oklch(0.30 0.06 163);
+
+  /* Shape lock: one radius scale. Nothing on this page is fully rounded. */
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+}
+
+:root {
+  --surface: oklch(0.99 0 0);
+  --surface-sunken: oklch(0.975 0.002 265);
+  --surface-raised: oklch(1 0 0);
+  --border: oklch(0.916 0.003 265);
+  --border-strong: oklch(0.86 0.004 265);
+  --text: oklch(0.21 0.006 265);
+  --text-muted: oklch(0.44 0.008 265);
+  --text-subtle: oklch(0.50 0.008 265);
+  --accent: oklch(0.52 0.13 163);
+  --accent: var(--color-accent-600);
+  --accent-solid: oklch(0.45 0.11 163);
+  --accent-contrast: oklch(0.99 0 0);
+  --danger: oklch(0.55 0.19 25);
+  --warning: oklch(0.6 0.13 70);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: oklch(0.17 0.004 265);
+    --surface-sunken: oklch(0.14 0.004 265);
+    --surface-raised: oklch(0.21 0.005 265);
+    --border: oklch(0.28 0.005 265);
+    --border-strong: oklch(0.36 0.006 265);
+    --text: oklch(0.96 0.002 265);
+    --text-muted: oklch(0.76 0.006 265);
+    --text-subtle: oklch(0.67 0.006 265);
+    --accent: var(--color-accent-400);
+    --accent-solid: var(--color-accent-400);
+    --accent-contrast: oklch(0.17 0.004 265);
+    --danger: oklch(0.68 0.16 25);
+    --warning: oklch(0.75 0.12 75);
+    color-scheme: dark;
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--surface-sunken);
+  color: var(--text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+/* One visible focus treatment across the whole app. */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Motion is functional here, and it is all suppressed when asked. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--surface-raised);
+}
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklch, var(--text) 6%, transparent),
+    transparent
+  );
+  animation: shimmer 1.6s infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .skeleton::after {
+    animation: none;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 999px;
+  border: 2px solid var(--surface-sunken);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

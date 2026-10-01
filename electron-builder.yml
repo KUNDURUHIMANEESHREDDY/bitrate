@@ -1,0 +1,64 @@
+# electron-builder configuration for the Bitrate desktop app.
+#
+# The packaged app is the whole product: server, UI and tools bootstrap in one
+# process. Only production dependencies and the built UI ship, so the installer
+# stays small and no dev toolchain is exposed to the user.
+
+appId: com.bitrate.desktop
+productName: Bitrate
+copyright: Bitrate contributors
+
+directories:
+  output: release
+  buildResources: desktop
+
+files:
+  - package.json
+  # The Electron entry point and its modules. Without these the asar has no
+  # main script, which electron-builder rejects at the sanity check.
+  - desktop/**/*.js
+  - desktop/icon.png
+  - server/**/*.js
+  - scripts/setup.js
+  - scripts/doctor.js
+  - web/dist/**/*
+  - '!**/*.map'
+  - '!**/*.md'
+
+# Native modules cannot be loaded from inside the archive.
+asarUnpack:
+  - '**/*.node'
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: desktop/icon.png
+  # Embedding the icon and version info into Bitrate.exe needs the winCodeSign
+  # toolchain, whose archive contains symlinks. Creating those requires Windows
+  # Developer Mode or an elevated shell, so a default build would fail on a
+  # stock account. Left off deliberately: the tray and taskbar icons are set
+  # from desktop/icon.png at runtime and are correct either way. Turn this on
+  # once Developer Mode is enabled to get the icon inside the .exe itself.
+  signAndEditExecutable: false
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Bitrate
+  # Install per user into the app directory, so the app's own files stay
+  # writable for the venv when a user has no admin rights.
+  allowElevation: false
+
+mac:
+  target: [dmg]
+  category: public.app-category.utilities
+  icon: desktop/icon.png
+
+linux:
+  target: [AppImage]
+  category: Utility
+  icon: desktop/icon.png
