@@ -22,6 +22,7 @@
     "test": "node test/tray-menu.test.mjs && node test/close.test.mjs && node test/engine.test.mjs && node test/ingest-validate.test.mjs && node test/trace.test.mjs && node test/resume.test.mjs",
     "test:trace": "node test/trace-download.test.mjs",
     "test:trace:verify": "node test/trace-verify.mjs",
+    "bench:aria2": "node test/bench-aria2.mjs",
     "eval": "node test/eval.mjs",
     "eval:ytdlp": "node test/eval-ytdlp.mjs",
     "eval:all": "node test/eval.mjs && node test/eval-ytdlp.mjs",

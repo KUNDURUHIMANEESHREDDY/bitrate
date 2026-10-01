@@ -24,7 +24,9 @@ console.log('Bitrate environment check\n');
 const ytdlp = path.join(VENV, bindir, isWin ? 'yt-dlp.exe' : 'yt-dlp');
 check('yt-dlp', fs.existsSync(ytdlp) ? ytdlp : 'yt-dlp', ['--version'], { required: true, path: ytdlp });
 check('ffmpeg', 'ffmpeg', ['-version'], { required: true });
-check('aria2c', 'aria2c', ['-version'], { required: false });
+// Two dashes. aria2c parses `-version` as a cluster of single-letter flags and
+// exits 28, so a single dash here reports aria2c as missing even when installed.
+check('aria2c', 'aria2c', ['--version'], { required: false });
 
 const py = path.join(VENV, bindir, isWin ? 'python.exe' : 'python');
 console.log(`  [${fs.existsSync(py) ? 'ok  ' : 'FAIL'}] python    ${fs.existsSync(py) ? 'venv present' : 'run: npm run setup'}`);

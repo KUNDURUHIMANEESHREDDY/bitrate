@@ -15,7 +15,7 @@ Speed here is mostly about *not doing work*, plus using the bandwidth you have.
 | --- | --- |
 | Passthrough by default | Grabs the stream the origin already serves. Re-encoding a 10 minute video can take longer than downloading it. |
 | 16 concurrent fragments | DASH and HLS streams are fetched in parallel segments. Works everywhere, no extra tools. |
-| aria2c when installed | Hands the transfer to a multi-connection downloader. Most CDNs throttle a single connection well below the link rate, so this is usually the largest single win. Optional. |
+| aria2c when installed | Hands the transfer to a multi-connection downloader, so a throttling origin gets several times the throughput of one connection. Measured at **5.8x** on a 48 MB file against an origin capping each connection at 6 MB/s (`npm run bench:aria2`). Optional. |
 | 3 concurrent jobs | A queue so several downloads share bandwidth instead of fighting for it. |
 | Merge is a stream copy | Combining video and audio rewrites the container over bytes already downloaded. It does not re-encode. |
 | Conversion is opt-in | MP3 and forced-MP4 are explicit choices, and the UI says they cost CPU time. |
@@ -27,6 +27,22 @@ Install aria2c and the same link gets meaningfully faster:
 winget install aria2.aria2      # Windows
 brew install aria2               # macOS
 sudo apt install aria2           # Debian/Ubuntu
+```
+
+The figure above is a local measurement, not a promise about any one site. It
+comes from `npm run bench:aria2`, which serves the file from a loopback origin
+that caps each connection separately the way a CDN does. A loopback server with
+no cap would show nothing, since there is no headroom for extra connections to
+win. What the number shows is that extra connections buy real throughput against
+an origin that throttles; how much depends on the origin, and against a host
+that does not throttle you would see very little.
+
+```
+48 MB file, origin capped at 6 MB/s per connection, median of 3
+
+  yt-dlp alone    11.17s   4.3 MB/s    2 connections
+  with aria2c      1.94s  24.8 MB/s   16 connections
+  speedup          5.76x
 ```
 
 ## Requirements

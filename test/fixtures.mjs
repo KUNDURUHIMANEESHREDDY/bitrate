@@ -18,6 +18,90 @@
 import http from 'node:http';
 import crypto from 'node:crypto';
 
+/**
+ * An origin that throttles each connection separately, the way a real CDN does.
+ *
+ * The README credits aria2c with being the biggest throughput win because
+ * origins cap a single connection well below the link rate. That claim can only
+ * be measured against a per-connection limit, not against a loopback socket,
+ * which has no limit and therefore no headroom for extra connections to win.
+ *
+ * The cap is enforced per response rather than globally, which is what makes it
+ * a fair model: sixteen connections get sixteen times the aggregate rate, up to
+ * whatever the host can actually push.
+ */
+export async function startThrottledOrigin({
+  body,
+  bytesPerSecond = 6 * 1024 * 1024,
+  chunkBytes = 256 * 1024,
+  port = 0,
+} = {}) {
+  if (!body) throw new Error('startThrottledOrigin needs a body to serve');
+  let base = '';
+  let connections = 0;
+  let peakConnections = 0;
+
+  const server = http.createServer((req, res) => {
+    if (req.url.split('?')[0] !== '/video.mp4') {
+      res.writeHead(404).end('not found');
+      return;
+    }
+
+    connections += 1;
+    peakConnections = Math.max(peakConnections, connections);
+
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    const start = range?.[1] ? Number(range[1]) : 0;
+    const end = Math.min(range?.[2] ? Number(range[2]) : body.length - 1, body.length - 1);
+
+    res.writeHead(range ? 206 : 200, {
+      'Content-Type': 'video/mp4',
+      'Content-Length': String(end - start + 1),
+      'Accept-Ranges': 'bytes',
+      ...(range ? { 'Content-Range': `bytes ${start}-${end}/${body.length}` } : {}),
+    });
+
+    // Each tick hands over one chunk worth of budget, paced to the cap. A
+    // connection asking for more than the cap allows simply takes longer, which
+    // is the behaviour the aria2c claim depends on.
+    const perChunkMs = (chunkBytes / bytesPerSecond) * 1000;
+    let pos = start;
+    let cancelled = false;
+    res.on('close', () => { cancelled = true; });
+
+    const pump = () => {
+      if (cancelled) { connections -= 1; return; }
+      if (pos > end) { res.end(); connections -= 1; return; }
+
+      const stop = Math.min(pos + chunkBytes - 1, end);
+      // Advance before writing. A full socket buffer makes write() return false
+      // and the chunk is queued regardless, so the resume must move past it
+      // rather than send the same bytes again when the drain fires.
+      const slice = body.subarray(pos, stop + 1);
+      pos = stop + 1;
+      if (!res.write(slice)) {
+        res.once('drain', () => setTimeout(pump, perChunkMs));
+        return;
+      }
+      setTimeout(pump, perChunkMs);
+    };
+    setTimeout(pump, perChunkMs);
+  });
+
+  await new Promise((r) => server.listen(port, '127.0.0.1', r));
+  base = `http://127.0.0.1:${server.address().port}`;
+
+  return {
+    base,
+    fileUrl: `${base}/video.mp4`,
+    body,
+    /** The most simultaneous range requests seen, which is what the win rests on. */
+    peakConnections: () => peakConnections,
+    resetPeak: () => { peakConnections = 0; },
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
 /** Deterministic bytes, so an expected digest can be recomputed independently. */
 export function makeBody(size, seed = 1) {
   const buf = Buffer.alloc(size);
