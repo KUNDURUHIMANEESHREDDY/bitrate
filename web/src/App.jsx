@@ -71,8 +71,11 @@ export default function App() {
           setProbeError(err.message);
           setInfo(null);
         }
-      } catch {
-        setProbeError(err.message);
+      } catch (scrapeErr) {
+        // The scrape's own message is the better one when it has one. An HLS-only
+        // page explains what to do instead; the extractor error would just say this
+        // site is unsupported, which is true and useless.
+        setProbeError(scrapeErr.message || err.message);
         setInfo(null);
       }
     } finally {

@@ -6,34 +6,70 @@ import {
 } from './jobs.js';
 import * as library from './library.js';
 import { hub } from './events.js';
+import { gates } from './limits.js';
+import { quickCheck, policy as netPolicy } from './network-policy.js';
+import { validateCookieFile, describeCookieFailure } from './credentials.js';
+import { increment, recordFailure, snapshot, setGauge } from './metrics.js';
 import {
   DOWNLOAD_DIR, WEB_DIST, CONCURRENT_FRAGMENTS, MAX_CONCURRENT, ARIA2C, FFMPEG, YTDLP,
+  MAX_QUEUE_SIZE, MAX_SCRAPE_BYTES, MAX_DOWNLOAD_BYTES,
 } from './config.js';
 
 /** Handlers return the payload itself; Fastify wraps it in the HTTP response. */
 const ok = (payload) => payload;
 
-/** Only http(s). Blocks file://, and the assorted schemes a page URL might carry. */
-function validUrl(raw) {
-  if (typeof raw !== 'string' || !raw.trim()) return null;
-  const candidate = raw.trim();
-  let parsed;
-  try {
-    parsed = new URL(candidate);
-  } catch {
-    // Bare hostnames are common enough to be worth rescuing.
-    try { parsed = new URL(`https://${candidate}`); } catch { return null; }
-  }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  if (!parsed.hostname || !parsed.hostname.includes('.')) return null;
-  return parsed.toString();
-}
-
-const fail = (code, message) => {
+const fail = (code, message, extra = {}) => {
   const err = new Error(message);
   err.statusCode = code;
+  Object.assign(err, extra);
   return err;
 };
+
+/** Snapshot the live numbers alongside the counters, so one read answers everything. */
+function withGauges() {
+  const q = stats();
+  setGauge('jobs_running', q.running);
+  setGauge('jobs_queued', q.queued);
+  setGauge('jobs_total', q.total);
+  setGauge('probes_in_flight', gates.probe.active);
+  setGauge('scrapes_in_flight', gates.scrape.active);
+  setGauge('event_clients', hub.size);
+  return snapshot();
+}
+
+/**
+ * Check a URL the caller handed us.
+ *
+ * Two stages on purpose. The synchronous one refuses the shapes that need no
+ * network to decide -- an IP literal in a range we will not reach, a scheme that
+ * is not http(s), a URL carrying credentials -- so an obviously bad request is
+ * refused without waiting on DNS. Anything involving a name is allowed through
+ * here and resolved properly when the request is actually made, because a lookup
+ * is the expensive part and a queue of callers should not each pay for one
+ * before the one before them has been served.
+ */
+function validUrl(raw) {
+  const verdict = quickCheck(raw);
+  if (verdict.ok) return verdict.url;
+  // Marked so the refusal is counted as a policy decision rather than as a
+  // download that failed, which are very different numbers to look at.
+  throw fail(400, verdict.reason, { blocked: true, blockedRange: verdict.range || 'invalid' });
+}
+
+/**
+ * Validate a caller-supplied cookie file.
+ *
+ * `cookieFile` is accepted as well as `cookies`, because that was the name the
+ * README used and a caller following an older copy of it should not silently get
+ * an unauthenticated download that fails for an unrelated-looking reason.
+ */
+function cookiesFrom(body) {
+  const supplied = body?.cookies ?? body?.cookieFile;
+  if (!supplied) return { ok: true, file: null };
+  const result = validateCookieFile(supplied);
+  if (!result.ok) return { ok: false, error: describeCookieFailure(result.error) };
+  return result;
+}
 
 export default async function api(app) {
   init();
@@ -47,16 +83,36 @@ export default async function api(app) {
     tuning: { concurrentFragments: CONCURRENT_FRAGMENTS, maxConcurrent: MAX_CONCURRENT },
     queue: stats(),
     clients: hub.size,
+    // The security posture, stated rather than assumed. A deployment should be
+    // able to answer "what is this instance allowed to reach" from the API.
+    network: {
+      policy: netPolicy.mode,
+      alwaysBlocked: netPolicy.blocks,
+      strictAlsoBlocks: netPolicy.strictAlsoBlocks,
+    },
+    limits: {
+      maxQueueSize: MAX_QUEUE_SIZE,
+      maxScrapeBytes: MAX_SCRAPE_BYTES,
+      maxDownloadBytes: MAX_DOWNLOAD_BYTES,
+      maxSseClients: hub.max,
+      maxConcurrentProbes: gates.probe.limit,
+      maxConcurrentScrapes: gates.scrape.limit,
+    },
   }));
 
   app.post('/api/probe', async (req) => {
     const url = validUrl(req.body?.url);
-    if (!url) throw fail(400, 'That does not look like a valid http(s) link.');
+    const cookie = cookiesFrom(req.body);
+    if (!cookie.ok) throw fail(400, cookie.error);
 
     try {
-      const info = await probe(url);
+      // Gated: an extraction is a yt-dlp process launch, which is expensive
+      // enough that an unbounded number of them is a way to make the app
+      // unresponsive rather than a way to use it.
+      const info = await gates.probe.run(() => probe(url, { cookieFile: cookie.file }));
       return ok(normaliseInfo(info));
     } catch (err) {
+      recordFailure(err, 'probe_failed');
       const detail = errors.cleanError(err.message);
       throw fail(422, detail
         ? detail
@@ -69,24 +125,29 @@ export default async function api(app) {
     // Used as the fallback when yt-dlp has no extractor for the page.
     if (req.body?.direct === true) {
       const fileUrl = validUrl(req.body?.fileUrl);
-      if (!fileUrl) throw fail(400, 'That does not look like a valid http(s) link.');
-      const referer = validUrl(req.body?.referer) || null;
+      const referer = req.body?.referer ? (quickCheck(req.body.referer).url || null) : null;
       const title = typeof req.body?.title === 'string' ? req.body.title.slice(0, 200) : null;
       // Remembered so that if the link has to be refreshed mid-transfer, the
       // retry lands on the same quality the user chose.
       const preferRes = typeof req.body?.res === 'string' ? req.body.res.slice(0, 20) : null;
+      // Cookies are deliberately not accepted here. The direct engine has no way to
+      // send them, so recording `usingCookies` for this path would claim something
+      // that never happened. Refusing is honest in a way a silently ignored
+      // parameter is not.
       const job = createJob({ url: fileUrl, title, direct: true, referer, preferRes });
       return publicJob(job);
     }
 
     const url = validUrl(req.body?.url);
-    if (!url) throw fail(400, 'That does not look like a valid http(s) link.');
 
     const kind = req.body?.kind === 'audio' ? 'audio' : 'video';
     const allowed = new Set(['best', '2160', '1440', '1080', '720', '480', '360']);
     const quality = allowed.has(req.body?.quality) ? req.body.quality : 'best';
     const audioFormat = ['best', 'mp3', 'm4a'].includes(req.body?.audioFormat) ? req.body.audioFormat : 'best';
     const title = typeof req.body?.title === 'string' ? req.body.title.slice(0, 200) : null;
+
+    const cookie = cookiesFrom(req.body);
+    if (!cookie.ok) throw fail(400, cookie.error);
 
     const job = createJob({
       url,
@@ -95,6 +156,7 @@ export default async function api(app) {
       audioFormat,
       remuxMp4: Boolean(req.body?.remuxMp4),
       subtitle: Boolean(req.body?.subtitle),
+      cookieFile: cookie.file,
       title,
     });
     return ok(publicJob(job));
@@ -103,14 +165,27 @@ export default async function api(app) {
   /**
    * Scrape a page for direct media links. This is the fallback for sites
    * yt-dlp cannot extract: fresh tokens are read at request time, never stored.
+   *
+   * A page whose only media is HLS gets a 422 with a reason rather than an empty
+   * list. The distinction matters to the person looking at it: "no direct links on
+   * this page" and "this page has streams but not files" are different problems, and
+   * the second one has a real answer -- hand the page URL to yt-dlp, which resolves
+   * a manifest properly.
    */
   app.post('/api/scrape', async (req) => {
     const url = validUrl(req.body?.url);
-    if (!url) throw fail(400, 'That does not look like a valid http(s) link.');
     try {
-      return await scrapeMediaLinks(url);
+      const found = await scrapeMediaLinks(url);
+      if (!found.links.length && found.hlsSeen) {
+        throw fail(422,
+          'This page offers HLS streams rather than direct file links. '
+          + 'Paste the page URL as a normal download instead: that path resolves the '
+          + 'playlist and its segments, which the direct downloader cannot do.',
+          { hlsOnly: true });
+      }
+      return found;
     } catch (err) {
-      throw fail(422, err.message || 'Could not read that page.');
+      throw fail(err.statusCode || 422, err.message || 'Could not read that page.');
     }
   });
 
@@ -132,6 +207,18 @@ export default async function api(app) {
     clearFinished();
     return ok({ cleared: true });
   });
+
+  /**
+   * Counters, for answering "why did that fail?" without reading a log.
+   *
+   * Every series carries its own meaning, because a rising number nobody can
+   * interpret is the same as no number at all.
+   */
+  app.get('/api/metrics', async () => ok({
+    ...withGauges(),
+    queue: stats(),
+    clients: hub.size,
+  }));
 
   app.get('/api/library', async () => ok(await library.list()));
 
@@ -170,11 +257,12 @@ export default async function api(app) {
     // Range support: without it Chrome cannot seek in the preview.
     const range = req.headers.range;
     if (range) {
-      const m = /bytes=(\d*)-(\d*)/.exec(range);
+      const m = /^bytes=(\d*)-(\d*)$/.exec(range);
       if (m) {
         const start = m[1] ? Number(m[1]) : 0;
         const end = m[2] ? Number(m[2]) : stat.size - 1;
-        if (start >= stat.size || end >= stat.size || start > end) {
+        if (!Number.isFinite(start) || !Number.isFinite(end)
+          || start >= stat.size || end >= stat.size || start > end) {
           reply.code(416).header('Content-Range', `bytes */${stat.size}`).send();
           return reply;
         }
@@ -190,7 +278,11 @@ export default async function api(app) {
   });
 
   app.get('/api/events', (req, reply) => {
-    hub.addClient(reply.raw, { lastEventId: Number(req.headers['last-event-id']) || 0 });
+    const client = hub.addClient(reply.raw, { lastEventId: Number(req.headers['last-event-id']) || 0 });
+    if (!client) {
+      reply.code(503).send({ error: 'Too many event streams open. Close another tab and retry.' });
+      return;
+    }
     // Tell Fastify the response is handled manually and will never end.
     reply.hijack();
   });

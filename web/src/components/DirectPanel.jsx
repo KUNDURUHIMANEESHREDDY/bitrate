@@ -65,7 +65,6 @@ export default function DirectPanel({ pageUrl, result, onStart, onReset, startin
             ].join(' ')}
           >
             {link.res}
-            {link.kind === 'hls' ? ' (stream)' : ''}
           </button>
         ))}
       </div>

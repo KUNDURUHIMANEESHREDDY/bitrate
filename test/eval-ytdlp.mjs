@@ -21,6 +21,15 @@ const outputDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'bitrate-ytdlp-eval-'
 process.env.BITRATE_DOWNLOAD_DIR = outputDir;
 process.env.BITRATE_DATA_DIR = path.join(outputDir, 'data');
 
+// This harness polls /api/jobs every 250 ms while each case runs, and a yt-dlp
+// case can take several seconds. Against the shipped request budget that polling
+// is enough to exhaust the allowance and have the suite refuse its own next
+// download, which is the limiter working correctly and the test tripping over
+// it. Raised here for the same reason stress.test.mjs raises them.
+process.env.BITRATE_RATE_DEFAULT = '200000';
+process.env.BITRATE_RATE_CREATE = '100000';
+process.env.BITRATE_RATE_PROBE = '100000';
+
 const { startServer } = await import('../server/app.js');
 const { startMediaFixtures, probeFile, cleanFixtures } = await import('./media-fixtures.mjs');
 const { buildFormatSelector } = await import('../server/engine.js');

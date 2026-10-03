@@ -10,6 +10,10 @@ import {
 import { runtime, ytdlpVersion } from './engine.js';
 import { hub } from './events.js';
 import { initTracing, shutdownTracing } from './trace.js';
+import { authenticate, assertBindingIsSafe, authStatus, isLoopbackBind } from './auth.js';
+import { chargeRequest } from './limits.js';
+import { increment, recordFailure } from './metrics.js';
+import { closeClient, closeEgressProxy } from './http-client.js';
 
 export const log = (...a) => console.log('[bitrate]', ...a);
 
@@ -34,25 +38,54 @@ export async function buildApp({ loggerLevel = process.env.BITRATE_LOG || 'warn'
     forceCloseConnections: true,
   });
 
-  // Loopback-only, but a page on another origin could still POST here.
-  // Blocking cross-origin requests stops a drive-by page from queueing downloads
-  // or deleting files through the user's browser session.
+  // Three checks run before any handler, in order of how much they cost an
+  // attacker to satisfy.
   app.addHook('onRequest', async (req, reply) => {
     if (!req.url.startsWith('/api/')) return;
+
+    // 1. Origin. Loopback-only, but a page on another origin could still POST
+    //    here. Blocking cross-origin requests stops a drive-by page from queueing
+    //    downloads or deleting files through the user's browser session.
     const origin = req.headers.origin;
     if (origin) {
       let host = null;
       try { host = new URL(origin).hostname; } catch { /* malformed origin */ }
       const allowed = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
       if (!host || !allowed.has(host)) {
+        increment('request_refused', { kind: 'cross_origin' });
         return reply.code(403).send({ error: 'Cross-origin requests are not allowed.' });
       }
+    }
+
+    // 2. Authentication. A no-op unless BITRATE_AUTH_TOKEN is set, which a
+    //    loopback install never needs.
+    try {
+      authenticate(req);
+    } catch (err) {
+      increment('request_refused', { kind: 'auth' });
+      return reply.code(err.statusCode || 401).send({ error: err.message });
+    }
+
+    // 3. Budget. After the cheap checks, so a rejected origin is not also
+    //    charged for the attempt.
+    try {
+      chargeRequest(req.ip || 'unknown', req.url);
+    } catch (err) {
+      increment('request_refused', { kind: 'budget' });
+      if (err.retryAfter) reply.header('Retry-After', String(err.retryAfter));
+      return reply.code(err.statusCode || 429).send({ error: err.message });
     }
   });
 
   app.setErrorHandler((err, req, reply) => {
     const status = err.statusCode && err.statusCode >= 400 ? err.statusCode : 500;
     if (status >= 500) req.log.error({ err }, 'request failed');
+    // One choke point for every handler failure, so a refusal is counted wherever
+    // it was decided. Anything reaching here already went through the checks
+    // above, so this only sees refusals raised by a route itself.
+    if (req.url.startsWith('/api/') && status >= 400) {
+      recordFailure(err, 'request_refused');
+    }
     reply.code(status).send({ error: err.message || 'Something went wrong.' });
   });
 
@@ -106,6 +139,14 @@ export async function startServer({
   loggerLevel,
   allowPortFallback = false,
 } = {}) {
+  // Refuses a non-loopback bind with no token configured. Checked before
+  // anything is built or bound, so an unsafe configuration cannot even reach
+  // the point of listening.
+  const binding = assertBindingIsSafe(host);
+  if (binding.required) {
+    log(`bound to ${host}; BITRATE_AUTH_TOKEN is required and enforced.`);
+  }
+
   let app = await buildApp({ loggerLevel });
 
   const bind = async (p) => {
@@ -143,6 +184,14 @@ export async function startServer({
     close: async () => {
       hub.closeAll();
       await app.close();
+      // Idle keep-alive sockets belong to the outbound client, not to Fastify, so
+      // Fastify's close will not touch them. Leaving them to their reuse timeout
+      // is what makes a desktop app look like it is hanging on quit.
+      closeClient();
+      // The proxy holds tunnelled TLS sockets that belong to no agent pool, so
+      // closing it is what stops a live child download from keeping the process
+      // alive after everything else has gone.
+      await closeEgressProxy();
       // Spans are batched in the background, so a process that exits without
       // flushing loses exactly the traces it just produced.
       await shutdownTracing();
@@ -158,5 +207,11 @@ export function toolReport() {
     [runtime.aria2c || has(ARIA2C), `aria2c ${has(ARIA2C) ? 'ready (multi-connection)' : 'absent (optional)'}`],
   ];
 }
+
+/** Whether this build's configuration is safe to expose on the network. */
+export const exposure = () => ({
+  loopback: isLoopbackBind(HOST),
+  auth: authStatus(),
+});
 
 export { CONCURRENT_FRAGMENTS, MAX_CONCURRENT };

@@ -5,13 +5,15 @@ import { startDownload } from './engine.js';
 import { startDirectDownload } from './direct.js';
 import { startSpan } from './trace.js';
 
-/** Host only, for tracing. Media URLs carry signed tokens; see trace.js. */
-function hostOf(url) {
-  try { return new URL(url).host; } catch { return null; }
-}
 import { hub } from './events.js';
 import { removeIfEmpty } from './library.js';
-import { DOWNLOAD_DIR, DATA_DIR, STATE_FILE, MAX_CONCURRENT, ensureDirs } from './config.js';
+import { DOWNLOAD_DIR, DATA_DIR, STATE_FILE, MAX_CONCURRENT, MAX_QUEUE_SIZE, ensureDirs } from './config.js';
+import {
+  ensureWorkspace, workspaceFor, findArtifact, promote, cleanup,
+  writeState, readState, pruneWorkspaces,
+} from './workspace.js';
+import { increment } from './metrics.js';
+import { hostOf } from './network-policy.js';
 
 const TERMINAL = new Set(['done', 'error', 'cancelled']);
 
@@ -22,11 +24,39 @@ let seq = 0;
 /** Serialise writes; concurrent job events must not interleave a read-modify-write. */
 let persistChain = Promise.resolve();
 
+/**
+ * The fields that may reach jobs.json.
+ *
+ * An allowlist rather than a deny-list, on purpose. Serialising the job object
+ * itself means every field added from here on is persisted by default, and a field
+ * only has to be *remembered* to be forgotten into a file that outlives the process:
+ * `cookieFile` is a path to a browser credential export, and for a direct download
+ * `url` carries the signed token the media server is currently honouring. A deny-list
+ * would have caught both today and would catch neither tomorrow.
+ *
+ * What is here is what the UI shows after a restart, plus what identifies the bytes.
+ * `usingCookies` is the deliberate substitute for `cookieFile`: the UI needs to know
+ * that cookies were involved, and has no use for where they came from.
+ */
+const PERSISTED = [
+  'id', 'title', 'kind', 'quality', 'audioFormat', 'remuxMp4', 'subtitle',
+  'usingCookies', 'direct', 'status', 'phase', 'percent', 'downloaded', 'total',
+  'speed', 'eta', 'error', 'file', 'workspace', 'recoverable', 'createdAt', 'finishedAt',
+];
+
+function persistedJob(j) {
+  const out = {};
+  for (const key of PERSISTED) {
+    if (j[key] !== undefined) out[key] = j[key];
+  }
+  return out;
+}
+
 function persist() {
   persistChain = persistChain.then(() => {
     try {
       const snapshot = JSON.stringify(
-        { seq, jobs: [...jobs.values()].slice(-200) },
+        { seq, jobs: [...jobs.values()].slice(-200).map(persistedJob) },
         null,
         2,
       );
@@ -49,18 +79,41 @@ function load() {
       // silently: the child process is gone. Mark it interrupted so the UI
       // shows the truth rather than a download that will never progress.
       if (!TERMINAL.has(j.status)) {
-        jobs.set(j.id, { ...j, status: 'error', error: 'Interrupted when the server stopped. Re-run to resume from the partial file.' });
+        jobs.set(j.id, {
+          ...j,
+          status: 'error',
+          error: 'Interrupted when the server stopped. Start it again to resume from the partial file.',
+          recoverable: true,
+        });
       } else {
+        // A job read back from disk has no url and no cookieFile, because neither
+        // was ever written. It is shown, not run: nothing here re-runs a job, so
+        // the fields a restart would need are the ones the UI already has.
         jobs.set(j.id, j);
       }
     }
   } catch { /* first run, or corrupt state: start clean */ }
 }
 
+/**
+ * The job as the UI sees it.
+ *
+ * `url` is here and `cookieFile` is not, and the difference is deliberate. A job
+ * list is rendered by anyone who can reach the API, and for a direct download the
+ * URL is a signed media link whose query string is a live credential for as long as
+ * the token is valid -- while the UI needs nothing from it, because the job already
+ * carries a title and a finished file name. `publicJob` therefore reports the host
+ * instead of the URL, which is enough to tell a user which site a job came from and
+ * useless to anyone who tries to replay it.
+ *
+ * `cookieFile` never appears here at all. Only the boolean `usingCookies` does.
+ */
 export function publicJob(j) {
   return {
     id: j.id,
-    url: j.url,
+    // Host rather than the full URL. The query string on a direct link carries a
+    // token that authorises a download while it is valid.
+    url: hostOf(j.url) || null,
     title: j.title,
     kind: j.kind,
     quality: j.quality,
@@ -73,6 +126,11 @@ export function publicJob(j) {
     eta: j.eta,
     error: j.error,
     file: j.file,
+    // Whether cookies were involved, never where they came from. The UI shows this
+    // so a user can tell why a download needed a browser session; it has no use for
+    // the path, and the path is a browser credential export.
+    usingCookies: Boolean(j.usingCookies),
+    recoverable: Boolean(j.recoverable),
     createdAt: j.createdAt,
     finishedAt: j.finishedAt,
   };
@@ -85,8 +143,23 @@ function announce(job) {
   }
 }
 
+/** How many jobs are occupying the queue, running or not. */
+const queueDepth = () => [...jobs.values()].filter((j) => !TERMINAL.has(j.status)).length;
+
 export function createJob({ url, kind = 'video', quality = 'best', audioFormat = 'best', remuxMp4 = false, subtitle = false, cookieFile = null, title = null, direct = false, referer = null, preferRes = null }) {
   ensureDirs();
+
+  // A queue with no ceiling is a memory and disk problem waiting for a caller
+  // that loops. Ten thousand queued jobs would otherwise sit there looking like
+  // work in progress and all of them would eventually be attempted.
+  if (queueDepth() >= MAX_QUEUE_SIZE) {
+    const err = new Error(
+      `The queue is full (${MAX_QUEUE_SIZE} jobs). Wait for something to finish, or clear finished jobs.`,
+    );
+    err.statusCode = 429;
+    throw err;
+  }
+
   const id = crypto.randomUUID();
   const job = {
     id,
@@ -97,7 +170,10 @@ export function createJob({ url, kind = 'video', quality = 'best', audioFormat =
     audioFormat,
     remuxMp4,
     subtitle,
+    // Never leaves the server: not in publicJob, not in a trace, not in an event.
+    // What the UI shows is whether cookies were used, not where they came from.
     cookieFile,
+    usingCookies: Boolean(cookieFile),
     direct: Boolean(direct),
     referer,
     preferRes,
@@ -110,10 +186,24 @@ export function createJob({ url, kind = 'video', quality = 'best', audioFormat =
     eta: null,
     error: null,
     file: null,
+    workspace: workspaceFor(id),
+    recoverable: false,
     createdAt: Date.now(),
     finishedAt: null,
   };
   jobs.set(id, job);
+  void ensureWorkspace(id).then(() => writeState(id, {
+    source: direct ? 'direct' : 'ytdlp',
+    // The workspace is the identity of this job's bytes, so it is what a restart
+    // reads to find them again. The URL is deliberately not recorded: for a
+    // direct download it usually carries a token that has expired anyway.
+    workspace: job.workspace,
+    quality,
+    audioFormat,
+    kind,
+    title: job.title,
+    startedAt: Date.now(),
+  }));
   void persist();
   announce(job);
   pump();
@@ -129,11 +219,22 @@ export function listJobs() {
 export function cancelJob(id) {
   const job = jobs.get(id);
   if (!job || TERMINAL.has(job.status)) return false;
+  // A job that was still queued never opened a file, so its workspace holds
+  // nothing worth resuming from and is pure litter. One that was mid-transfer is a
+  // different matter: the bytes are kept, but whether there are *any* worth keeping
+  // is not known until the engine reports back, so `recoverable` is set optimistically
+  // here and corrected in the `onClose` handler. A cancel in the first moments of a
+  // transfer has nothing on disk, and claiming otherwise is what made this flag
+  // mean nothing.
+  const neverStarted = job.status === 'queued';
   job._kill?.();
   job.status = 'cancelled';
   job.phase = 'cancelled';
   job.speed = 0;
   job.finishedAt = Date.now();
+  job.recoverable = !neverStarted;
+  increment('download_cancelled', { stage: neverStarted ? 'queued' : 'running' });
+  if (neverStarted) void cleanup(id);
   announce(job);
   void persist();
   return true;
@@ -141,7 +242,11 @@ export function cancelJob(id) {
 
 export function clearFinished() {
   for (const [id, j] of jobs) {
-    if (TERMINAL.has(j.status)) jobs.delete(id);
+    if (!TERMINAL.has(j.status)) continue;
+    jobs.delete(id);
+    // A finished job's workspace is scratch that has already been promoted, or
+    // that will never be. Either way it should not outlive the job record.
+    void cleanup(id);
   }
   void persist();
   hub.broadcast('jobs-cleared', {});
@@ -164,6 +269,7 @@ function run(job) {
   job.status = 'running';
   job.phase = 'downloading';
   job.error = null;
+  increment('download_started', { source: job.direct ? 'direct' : 'ytdlp' });
   announce(job);
 
   // One trace per download: a self-contained unit of work with a clear outcome.
@@ -205,15 +311,21 @@ function run(job) {
     // Direct (IDM-style) jobs skip yt-dlp entirely: the URL already points at
     // media bytes, so segmented Range requests are faster and avoid extractor
     // limitations such as the .php-extension safety block.
+    //
+    // Both engines are pointed at this job's own workspace rather than the
+    // download directory. That is what makes the finished artifact identifiable
+    // afterwards without guessing from timestamps in a shared directory.
     const handle = job.direct
       ? startDirectDownload({
         url: job.url,
         referer: job.referer,
         title: job.title,
         preferRes: job.preferRes,
+        destDir: job.workspace || DOWNLOAD_DIR,
       }, makeHandlers(job))
       : startDownload({
         ...job,
+        destDir: job.workspace || DOWNLOAD_DIR,
         // Anything that transcodes or remuxes must not share a name with a file
         // an earlier passthrough produced, because yt-dlp deletes its own input.
         uniqueOutput: job.kind === 'audio'
@@ -267,7 +379,7 @@ function makeHandlers(job) {
       // have been. Record it now so it can be removed once the real path is known.
       job._emptyLeftovers = job._emptyLeftovers || [];
     },
-    onClose(code, finalPath) {
+    onClose(code, finalPath, info) {
       running.delete(job.id);
       job._kill = null;
 
@@ -282,108 +394,154 @@ function makeHandlers(job) {
       };
 
       if (job.status === 'cancelled') {
+        // The engine reports whether it actually left bytes behind.
+        //
+        // `cancelJob` has already set `recoverable` on the assumption that a
+        // running job has a partial worth keeping. That assumption was unchecked:
+        // the direct engine used to delete the partial before noticing the abort,
+        // so a cancelled job claimed to be resumable with nothing on disk. Trusting
+        // the engine's own count instead means the flag says what it means.
+        if (job.direct && info && typeof info.bytesKept === 'boolean') {
+          job.recoverable = info.bytesKept;
+          // Nothing to resume from, so the workspace is litter rather than an
+          // opportunity -- the same treatment a queued job gets.
+          if (!info.bytesKept) {
+            job.error = 'Cancelled before any data arrived.';
+            void cleanup(job.id);
+          }
+        }
         finish();
         void persist();
         pump();
         return;
       }
 
-      // The path yt-dlp reported is the only trustworthy source. A time-window
-      // scan of the download folder is NOT safe here: with concurrency above 1
-      // it happily returns a sibling job's file and reports a failed download
-      // as successful. The scan is only a last resort for a clean exit.
-      const reported = describeOutput(finalPath);
-      const output = reported || (code === 0 ? findOutputFor(job) : null);
-
-      // Sweep up any empty file the failed post-processor left behind.
-      if (job._postprocessNote) {
-        for (const p of [finalPath, ...(job._emptyLeftovers || [])]) {
-          if (p) removeIfEmpty(p);
-        }
-      }
-
-      if (code === 0 || output) {
-        if (!output) {
-          job.status = 'error';
-          job.phase = 'error';
-          job.speed = 0;
-          job.finishedAt = Date.now();
-          job.error = job.error || 'The download finished but no file was written.';
-          announce(job);
-          finish();
-          void persist();
-          pump();
-          return;
-        }
-        job.status = 'done';
-        job.phase = 'done';
-        job.percent = 100;
-        job.speed = 0;
-        job.finishedAt = Date.now();
-        job.file = output;
-        if (job._postprocessNote) {
-          job.error = `Kept the original file. ${job._postprocessNote}`;
-        }
-        announce(job);
+      void resolveOutcome(job, code, finalPath).then(() => {
+        finish();
         void persist();
-      } else {
-        job.status = 'error';
-        job.phase = 'error';
-        job.speed = 0;
-        job.finishedAt = Date.now();
-        job.error = job.error || 'Download failed. Check the link and try again.';
-        announce(job);
-        void persist();
-      }
-      finish();
-      pump();
+        pump();
+      });
     },
   };
 }
 
 /**
- * Turn the path yt-dlp reported into a library entry.
- * Confirms the file really landed inside the download directory before
- * exposing it, so a misbehaving extractor cannot steer writes elsewhere.
+ * Is there a partial file in this job's workspace worth resuming from?
+ *
+ * Size on disk is not the question, because a ranged direct download preallocates
+ * the whole file: a `.part` is the full length from the first moment and says
+ * nothing about how much of it is real. What can be trusted is whether anything
+ * exists at all, since the engine deletes an empty one.
  */
-function describeOutput(fullPath) {
-  if (!fullPath) return null;
+function hasPartialBytes(job) {
+  const dir = job.workspace;
+  if (!dir) return false;
   try {
-    const resolved = path.resolve(fullPath);
-    const base = path.resolve(DOWNLOAD_DIR);
-    if (resolved !== base && !resolved.startsWith(base + path.sep)) return null;
-    const st = fs.statSync(resolved);
-    // A zero-byte file is a failed remux or a truncated transfer, never a result.
-    if (!st.isFile() || st.size === 0) return null;
-    return { name: path.basename(resolved), size: st.size };
+    return fs.readdirSync(dir).some((name) => {
+      if (!/\.part$/i.test(name) && !/\.ytdl\b/i.test(name)) return false;
+      try { return fs.statSync(path.join(dir, name)).size > 0; } catch { return false; }
+    });
   } catch {
-    return null;
+    return false;
   }
 }
 
 /**
- * Fallback for when yt-dlp never reported a path: match on the creation window
- * rather than trying to predict the filename.
+ * Decide what a finished job actually produced, and move it into the library.
+ *
+ * Two sources, in order of trust:
+ *
+ *   the path the engine reported    confirmed to be inside this job's own
+ *                                   workspace, and confirmed to be a real
+ *                                   non-empty file
+ *   a scan of this job's workspace  the fallback for a clean exit where nothing
+ *                                   was reported
+ *
+ * Neither is a directory-wide search by timestamp. That used to be the third
+ * option, and it was the source of a class of bug where two concurrent jobs
+ * finishing in the same second meant one of them claimed the other's file.
  */
-function findOutputFor(job) {
-  try {
-    const entries = fs.readdirSync(DOWNLOAD_DIR, { withFileTypes: true });
-    const media = entries
-      .filter((e) => e.isFile())
-      .map((e) => {
-        const full = path.join(DOWNLOAD_DIR, e.name);
-        let st;
-        try { st = fs.statSync(full); } catch { return null; }
-        return { name: e.name, full, size: st.size, mtime: st.mtimeMs };
-      })
-      .filter(Boolean)
-      .filter((f) => !f.name.endsWith('.part') && !f.name.endsWith('.ytdl'))
-      .filter((f) => f.size > 0)
-      .filter((f) => f.mtime >= job.createdAt - 5_000);
+async function resolveOutcome(job, code, finalPath) {
+  // Sweep up any empty file a failed post-processor left behind before looking
+  // for a real one, so a zero-byte leftover cannot be mistaken for the artifact.
+  if (job._postprocessNote) {
+    for (const p of [finalPath, ...(job._emptyLeftovers || [])]) {
+      if (p) removeIfEmpty(p);
+    }
+  }
 
-    if (!media.length) return null;
-    media.sort((a, b) => b.mtime - a.mtime);
-    return { name: media[0].name, size: media[0].size };
+  const artifact = describeOutput(finalPath, job.workspace)
+    || (code === 0 ? await findArtifact(job.workspace) : null);
+
+  if (!artifact) {
+    job.status = 'error';
+    job.phase = 'error';
+    job.speed = 0;
+    job.finishedAt = Date.now();
+    job.error = job.error || (code === 0
+      ? 'The download finished but no file was written.'
+      : 'Download failed. Check the link and try again.');
+    // The workspace is kept, so a re-run has somewhere to work. Whether that is
+    // worth calling recoverable depends on whether anything is in it, and only the
+    // engine knows that: a direct job deletes its partial on a genuine failure, so
+    // an empty workspace is litter rather than an opportunity. yt-dlp keeps its own
+    // `.part` and resumes from it, so for that path the workspace is always the
+    // answer.
+    job.recoverable = job.direct ? hasPartialBytes(job) : true;
+    increment('download_failed', { source: job.direct ? 'direct' : 'ytdlp' });
+    announce(job);
+    return;
+  }
+
+  try {
+    const entry = await promote(artifact);
+    job.status = 'done';
+    job.phase = 'done';
+    job.percent = 100;
+    job.speed = 0;
+    job.finishedAt = Date.now();
+    job.file = { name: entry.name, size: entry.size };
+    job.recoverable = false;
+    if (job._postprocessNote) {
+      job.error = `Kept the original file. ${job._postprocessNote}`;
+    }
+    increment('download_completed', { source: job.direct ? 'direct' : 'ytdlp' });
+    increment('bytes_transferred', { source: job.direct ? 'direct' : 'ytdlp' }, entry.size);
+    announce(job);
+    await writeState(job.id, { ...(await readState(job.id) || {}), completedAt: Date.now() });
+    // The bytes are in the library; the scratch copy has served its purpose.
+    void cleanup(job.id);
+  } catch (err) {
+    job.status = 'error';
+    job.phase = 'error';
+    job.speed = 0;
+    job.finishedAt = Date.now();
+    job.error = `The file downloaded but could not be moved into the library: ${err.message}`;
+    job.recoverable = true;
+    increment('download_failed', { source: 'promote' });
+    announce(job);
+  }
+}
+
+/**
+ * Turn a path the engine reported into a real artifact.
+ *
+ * Two things are confirmed rather than trusted. First, that the path is inside
+ * this job's own workspace: the engine is an external program writing names of
+ * its own choosing, so "it said where the file is" is not the same as "the file
+ * is where it said". Second, that it is a non-empty regular file, because a
+ * failed remux leaves a zero-byte file at exactly the path it was going to write.
+ */
+function describeOutput(fullPath, workspace) {
+  if (!fullPath) return null;
+  try {
+    const resolved = path.resolve(fullPath);
+    const base = path.resolve(workspace || DOWNLOAD_DIR);
+    if (resolved !== base && !resolved.startsWith(base + path.sep)) return null;
+    const st = fs.statSync(resolved);
+    // A zero-byte file is a failed remux or a truncated transfer, never a result.
+    if (!st.isFile() || st.size === 0) return null;
+    return { name: path.basename(resolved), full: resolved, size: st.size };
   } catch {
     return null;
   }
@@ -392,6 +550,10 @@ function findOutputFor(job) {
 export function init() {
   ensureDirs();
   load();
+  // Workspaces belong to jobs. A crashed process leaves one behind for a job that
+  // is still recorded, which is a resume opportunity; anything whose job is gone
+  // is scratch nobody will ever come back for.
+  void pruneWorkspaces([...jobs.keys()]);
 }
 
 export const stats = () => ({
@@ -399,6 +561,7 @@ export const stats = () => ({
   running: running.size,
   queued: [...jobs.values()].filter((j) => j.status === 'queued').length,
   maxConcurrent: MAX_CONCURRENT,
+  maxQueueSize: MAX_QUEUE_SIZE,
 });
 
 export { DATA_DIR };

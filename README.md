@@ -141,8 +141,29 @@ npm test             # tray menu policy, and that shutdown stays prompt
 Two layers, because they answer different questions.
 
 `npm test` is fast, offline and deterministic. It checks the tray menu's policy
-and wiring, the yt-dlp engine's pure decisions, and that shutting the server
-down stays prompt.
+and wiring, the yt-dlp engine's pure decisions, that shutting the server down
+stays prompt, that a dead link resumes rather than restarts, and — for the parts
+where a bug produces plausible-looking output rather than an error — that the
+download engine cannot be fooled into writing the wrong bytes:
+
+| Suite | Covers |
+| --- | --- |
+| `security.test.mjs` | Address classification including the IPv6 spellings, redirect SSRF, scraped-media filtering, path traversal, symlinks, cookie validation, `206` integrity, body size ceilings, and the counters |
+| `auth.test.mjs` | That a non-loopback bind without a token will not start, and that a configured token is enforced — each case in its own process, because that is the only way to test a startup check |
+| `recovery.test.mjs` | Concurrent jobs cannot claim each other's files, interrupted jobs keep their bytes, promotion into the library |
+| `stress.test.mjs` | That the concurrency gates, request budgets, queue ceiling and event-stream ceiling hold |
+| `idm.test.mjs` | That the CLI wrapper downloads correctly, and inherits the same network policy |
+| `egress.test.mjs` | That the proxy yt-dlp is bound to resolves and checks every hop, including `CONNECT`, and that nothing smuggles past it |
+| `token.test.mjs`, `token-live.test.mjs` | That the UI's surfaces which cannot set a header still carry a token, and that none of them works without one |
+| `leak.test.mjs` | That no cookie path or signed media URL reaches disk or a response |
+| `manifest.test.mjs` | That a playlist is never offered to the byte-range engine, refused if one arrives anyway, and never saved |
+| `cancel.test.mjs` | That a cancelled download keeps its bytes, that `recoverable` says so honestly in both directions, and that a failure still cleans up |
+
+The 206 cases are the ones worth reading. Each fixture lies in a different way —
+claims the wrong window, streams past the end of one, declares a length that is
+not the window, or closes the body early — and each has to be refused, because a
+file of exactly the right length containing the wrong bytes is the failure mode
+nothing downstream can catch.
 
 `npm run eval` is the direct engine's eval suite, and `npm run eval:ytdlp` is
 the yt-dlp one. Each case is queued through the same HTTP API the UI uses, so
@@ -266,10 +287,12 @@ All optional, all read at startup.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `BITRATE_HOST` | `127.0.0.1` | Bind address. Leave alone unless you intend to expose it. |
+| `BITRATE_HOST` | `127.0.0.1` | Bind address. Changing this requires `BITRATE_AUTH_TOKEN`; see below. |
 | `BITRATE_PORT` | `4820` | Port. |
+| `BITRATE_AUTH_TOKEN` | *(none)* | Bearer token required on every `/api` request. |
+| `BITRATE_NETWORK_POLICY` | `lan` | Which addresses outbound requests may reach. See below. |
 | `BITRATE_DOWNLOAD_DIR` | `./downloads` | Where files land. Packaged desktop: `Videos/Bitrate`. |
-| `BITRATE_DATA_DIR` | `./data` | Job history. Packaged desktop: user-data directory. |
+| `BITRATE_DATA_DIR` | `./data` | Job history and per-job workspaces. Packaged desktop: user-data directory. |
 | `BITRATE_VENV` | `./.venv` | Python environment holding yt-dlp. Read by the setup and doctor scripts. |
 | `BITRATE_PYTHON` | `./.venv/.../python` | Explicit Python path. |
 | `BITRATE_YTDLP` | `./.venv/.../yt-dlp` | Explicit yt-dlp path. |
@@ -277,6 +300,30 @@ All optional, all read at startup.
 | `BITRATE_FRAGMENTS` | `16` | Parallel segments per stream. |
 | `BITRATE_FFMPEG` | `ffmpeg` | Path to ffmpeg. |
 | `BITRATE_ARIA2C` | `aria2c` | Path to aria2c. |
+
+### Resource budgets
+
+Every one of these is a separate way a single request becomes a large amount of
+work, so each has its own ceiling rather than sharing the download concurrency
+limit. `npm run doctor` prints the values actually in force.
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `BITRATE_MAX_QUEUE_SIZE` | `200` | Jobs running plus queued. |
+| `BITRATE_MAX_PROBES` | `2` | Concurrent yt-dlp metadata extractions. |
+| `BITRATE_MAX_SCRAPES` | `4` | Concurrent page scrapes. |
+| `BITRATE_MAX_SCRAPE_BYTES` | `8 MB` | Page body read into memory. |
+| `BITRATE_MAX_DOWNLOAD_BYTES` | `64 GB` | Size a direct download will accept. |
+| `BITRATE_MAX_SSE_CLIENTS` | `8` | Open progress streams. |
+| `BITRATE_PROBE_TIMEOUT_MS` | `90000` | Wall clock for one extraction. |
+| `BITRATE_SCRAPE_TIMEOUT_MS` | `25000` | Wall clock for one scrape. |
+| `BITRATE_STALL_MS` | `60000` | Time a transfer may make no progress. |
+| `BITRATE_RATE_*` | see `config.js` | Requests per minute, per route class. |
+
+The stall timeout is not a request timeout. A 4 GB file legitimately outlives any
+whole-request budget, and a stalled socket is otherwise indistinguishable from a
+slow one until the job has shown "downloading" at 0 bytes/s for an hour. It is
+measured per chunk, so a transfer that is still moving is never touched.
 
 ## How output is named
 
@@ -288,18 +335,42 @@ That is deliberate: yt-dlp downloads an intermediate file, converts it, then
 deletes the intermediate. Without the token, converting a video whose audio you
 had already downloaded would delete that earlier file.
 
+### Where a file is built
+
+Each job gets its own directory under `data/jobs/<job-id>/`. The download is
+built there and moved into the download directory only once it is verified
+complete. Two things follow from that:
+
+- A finished job's artifact is identified inside a directory nothing else is
+  writing to, rather than guessed at by comparing timestamps in a directory
+  several jobs share. Two downloads finishing in the same second used to be
+  indistinguishable, and the loser could be reported as having produced the
+  winner's file.
+- An interrupted or cancelled job leaves its partial file behind, so a restart has
+  something to resume from instead of nothing.
+- `recoverable` is set from whether bytes were actually kept, not from whether a
+  job happened to be running. A cancelled download that had moved megabytes keeps
+  its `.part` and is resumable; one cancelled in its first moments has a
+  preallocated-but-empty file, which is deleted rather than advertised as a resume
+  opportunity that would re-download everything. A job that genuinely failed deletes
+  its partial too, since a dead link is not worth resuming.
+
+`data/jobs/` can be deleted at any time; the only thing lost is unfinished work.
+
 ## Sites that need cookies
 
 Some sites block unauthenticated requests. Export cookies from a logged-in
-browser session to a `cookies.txt` file, then pass the path as `cookieFile` to
-`POST /api/downloads`. Treat that file as a credential: it grants whatever
-access your browser session has. It is gitignored.
+browser session to a `cookies.txt` file, then pass the path as `cookies` to
+`POST /api/downloads`. Treat that file as a credential: it grants whatever access
+your browser session has. It is gitignored, and the path never appears in job
+state, traces or logs.
 
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `GET` | `/api/health` | Engine availability and current tuning. |
+| `GET` | `/api/health` | Engine availability, tuning, network policy and every limit in force. |
+| `GET` | `/api/metrics` | Counters for what has succeeded, failed or been refused. |
 | `POST` | `/api/probe` | Read metadata and available formats for a link. |
 | `POST` | `/api/downloads` | Queue a download. |
 | `GET` | `/api/jobs` | All jobs, newest first. |
@@ -319,11 +390,32 @@ The flow for those is:
 2. The UI automatically calls `POST /api/scrape`, which reads the page as a
    browser would and returns its direct file links, highest quality first.
 3. Picking one queues a direct job: 8 parallel `Range` segments written into
-   a preallocated file, with per-segment retries. Cancel works mid-flight.
+   a preallocated file, with per-segment retries. Cancel works mid-flight and keeps
+   whatever had already been written.
 
 Direct jobs appear in the same queue, progress stream, and library as
 everything else. Their filenames carry a short token because conversions
 never apply to them and the name must not collide with yt-dlp output.
+
+#### HLS is not offered here, on purpose
+
+A `.m3u8` or `.mpd` is a playlist — a text file listing other URLs — and a
+byte-range downloader cannot fetch one. The direct engine probes for a length,
+plans windows across the body and writes them to disk; none of that means
+anything for a document whose content is a list of links to fetch next.
+
+So a page offering only HLS gets a `422` explaining that, and a page offering both
+offers only the file. The engine also refuses a manifest outright, as a backstop for
+a URL arriving by some other route.
+
+This matters because the alternative is worse than an error. A CDN serving a
+playlist with an honest `Content-Length` makes the download *succeed*, and a few
+kilobytes of playlist text land in the library under a video name, where nothing
+downstream can tell them from a broken video.
+
+These links are not useless, just not to this engine. Paste the page URL as a
+normal download and yt-dlp resolves the manifest, fetches the segments and hands
+them to ffmpeg.
 
 ### Expiring links
 
@@ -342,15 +434,168 @@ usually already dead by the time it is used. Two things keep this invisible:
 
 ## Security posture
 
-- Binds loopback by default. Do not change `BITRATE_HOST` without putting
-  authentication in front of it: there is no login, and anyone who can reach
-  the port can queue downloads and read every downloaded file.
-- Cross-origin API requests are rejected, so a page in your browser cannot
-  drive the server.
-- Only `http` and `https` links are accepted. `file://` is refused, so it
-  cannot be used to read local files.
-- Media paths are resolved and confirmed to sit inside the download directory.
-- Job history is capped at 200 entries.
+### Where outbound requests are allowed to go
+
+Every request the server makes on your behalf — the scraper, the size probe, each
+range window, the media URLs pulled out of a page, and every request yt-dlp makes
+— goes through one policy layer (`server/network-policy.js`) and one transport
+(`server/http-client.js`). The order is the point:
+
+```
+parse → resolve DNS → refuse a blocked address → connect to that exact address
+      → on a redirect, resolve and check again for the new hop → read the body
+```
+
+Checking the URL you pasted is not enough, for two reasons that are easy to miss.
+A hostname can resolve to an address you did not intend, and a URL that looks
+entirely innocent can answer `302` to somewhere that is not. So redirects are
+followed one hop at a time and each hop is resolved and approved on its own terms.
+A public page that lists `http://127.0.0.1/` among its media links is treated as
+an attempt to aim the downloader, not as a page with an unusual link on it.
+
+And the address that was approved is the address that is connected to. The
+approved list is handed to the socket layer as its resolver, so no second lookup
+ever happens: a name that answers public once and private a moment later cannot
+get a different answer, because nothing asks it again. (`fetch` cannot be used
+here — it resolves the hostname itself and offers no way to supply a resolver or
+a pinned dispatcher, which is exactly the gap this closes. `node:http` does take
+a `lookup`, and `Readable.toWeb` gives back a standard stream, so the bodies are
+still read with `getReader()` as before.)
+
+### yt-dlp is inside the policy, not merely checked against it
+
+yt-dlp is a child process with its own HTTP client, its own DNS and its own
+redirect handling. Checking a URL in the API handler before spawning it looks like
+a policy and is not one: it describes the request the caller asked for, while the
+requests yt-dlp actually makes include every redirect hop, every media segment and
+every endpoint the site decides to call. An innocent-looking pasted URL that answers
+`302` to `169.254.169.254` reaches the metadata service exactly as surely as asking
+for it directly would, and validating the entry URL changes nothing about that.
+
+So yt-dlp is given `--proxy` pointing at a local filtering proxy
+(`server/egress-proxy.js`), and that proxy is the only route out. Each request it
+forwards has its destination resolved, classified, and pinned to the very addresses
+the policy approved — including `CONNECT`, so a TLS destination is approved before
+its tunnel exists. A hop to a refused address fails there and then, mid-chain, which
+is the only place a redirect-aware check can act. aria2c gets the same flag, since it
+opens its own connections.
+
+A refusal is returned to the child as a `403` with the reason in the body, so a
+blocked destination reads as "that address is not allowed" rather than as a
+connection failure. Set `BITRATE_NETWORK_POLICY=open` to disable the filtering; the
+proxy still runs.
+
+Blocked in every mode: link-local and `169.254.169.254` (cloud instance
+metadata), carrier-grade NAT, multicast, reserved and unspecified addresses, and
+their IPv4-mapped IPv6 spellings — `::ffff:127.0.0.1` is a loopback address
+wearing a hat. A name resolving to both a public and a blocked address is
+refused, because none of its answers may be blocked.
+
+| `BITRATE_NETWORK_POLICY` | Loopback | RFC1918 | Everything above |
+| --- | --- | --- | --- |
+| `lan` *(default)* | allowed | allowed | link-local and friends refused |
+| `strict` | refused | refused | public only |
+| `open` | allowed | allowed | nothing refused |
+
+`lan` is the default because a downloader legitimately targets those ranges: a
+NAS, a local media server, a dev server on your own machine. Use `strict` if you
+only ever download from the public internet. `open` disables the filter entirely
+and `npm run doctor` will warn about it.
+
+The current policy is reported by `GET /api/health`, so a deployment never has to
+be asked which one it is running.
+
+### Exposing it beyond this machine
+
+Binding to anything other than loopback **without** `BITRATE_AUTH_TOKEN` is a
+startup error, not a warning:
+
+```
+$ BITRATE_HOST=0.0.0.0 npm start
+Refusing to bind 0.0.0.0: that is reachable from the network and this API has no
+authentication. Set BITRATE_AUTH_TOKEN to a long random string, or bind to
+127.0.0.1 to keep it local.
+```
+
+The insecure configuration is not reachable by accident; you have to ask for it
+by name. With a token set, every `/api` request needs
+`Authorization: Bearer <token>`. `?access_token=` is also accepted, because
+EventSource and `<video>` cannot set headers — which means the query form will
+end up in logs and history, so put TLS in front of it if the port is reachable
+beyond your own machine.
+
+#### The UI carries the token too
+
+A configured token that the bundled UI does not send turns the app into something
+that looks like a disconnected server rather than an authentication failure, and
+that is a confusing way to discover a security feature. So the client sends it:
+
+- Ordinary requests use the `X-Bitrate-Token` header. A header beats a query
+  parameter because a query string lands in proxy logs and browser history, and this
+  one is a full-control credential.
+- The three surfaces that cannot set a header — the SSE progress stream, the media
+  preview and a download link — append `?access_token=`, which the server accepts
+  for exactly that reason.
+
+In the desktop app the shell hands the token to the page through a preload bridge
+(`desktop/preload.cjs`). That bridge is deliberately tiny: it reads one value from
+the environment, exposes it, and opens no IPC channel, because a preload with a
+message channel invites more messages later. It is `.cjs` rather than `.js` because
+a sandboxed preload runs without Node's module loader.
+
+Serving the UI from a browser rather than the shell works too: open
+`http://127.0.0.1:4820/#token=<token>`. A fragment rather than a query parameter,
+because a fragment is never sent to the server and never appears in a `Referer`
+header.
+
+### Everything else
+
+- Cross-origin API requests are rejected, so a page in your browser cannot drive
+  the server. This is the check that actually stops the realistic attack: a
+  drive-by page arriving as ordinary same-machine traffic is indistinguishable
+  from the app itself by address alone.
+- Only `http` and `https` links are accepted, and a URL carrying `user:pass@` is
+  refused because those credentials end up in process arguments.
+- Media paths are resolved twice — lexically, then through `realpath` — so
+  neither `../` nor a symlink planted in the download directory can read or delete
+  a file outside it. Symlinks are not listed, streamed or revealed.
+- Cookie files are validated as regular non-symlink files, refused inside the
+  download or data directory, and never written into job state, traces, events or
+  log lines. A job record says *whether* cookies were used, never where from.
+- Nothing is persisted because it happened to be on the job object. `jobs.json` is
+  written from an explicit allowlist, so a field added later is not persisted by
+  default and cannot be forgotten into a file that outlives the process.
+- A signed media URL is not returned by the API. For a direct download the query
+  string is a credential that authorises a download while it is valid, and the job
+  list has no use for it: `GET /api/jobs` reports the **host** instead, which is
+  enough to show which site a job came from and useless to anyone replaying it. The
+  same shape goes to `POST /api/downloads` and to the event stream, since all three
+  are `publicJob`.
+- A `206` is a claim, not a guarantee. The requested start offset, the declared
+  window and the actual byte count are all verified, because a CDN that answers
+  the wrong window produces a file of exactly the right length containing the
+  wrong bytes, which nothing downstream can detect.
+- `ETag`/`Last-Modified` are sent as `If-Range` on a resumed window, so an origin
+  that swaps the file mid-transfer causes a clean restart instead of two versions
+  spliced together.
+- `spawn()` is used with argument arrays throughout, yt-dlp runs with
+  `--ignore-config`, and an output path is only trusted after being confirmed to
+  sit inside the job's own workspace.
+
+### When something does go wrong
+
+`GET /api/metrics` reports counters, each carrying its own description, so
+"why did that fail?" is a lookup rather than a log-reading exercise:
+
+```
+download_started / completed / failed / cancelled / refreshed / restarted
+bytes_transferred · probe_failed · scrape_failed · request_refused
+ssrf_blocked · range_rejected
+```
+
+A blocked address is counted separately from a failed probe, because a policy
+decision and a broken website are different problems and should not look the
+same in a graph. Counters are in memory and reset on restart.
 
 ## Scope
 

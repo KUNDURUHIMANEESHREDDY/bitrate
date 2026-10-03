@@ -57,9 +57,13 @@ for (const d of [DOWNLOADS, DATA, VENV]) {
   log('ensured', d);
 }
 
-for (const [bin, label] of [['ffmpeg', 'ffmpeg (needed to merge video and audio)'],
-                            ['aria2c', 'aria2c (optional, faster transfers)']]) {
-  const found = run(bin, ['-version'], { stdio: 'ignore' }).status === 0;
+for (const [bin, label, versionFlag] of [['ffmpeg', 'ffmpeg (needed to merge video and audio)', '-version'],
+                                          ['aria2c', 'aria2c (optional, faster transfers)', '--version']]) {
+  // Two different spellings, because the two tools define different flags. aria2c
+  // parses `-version` as a cluster of single-letter flags and exits 28; ffmpeg
+  // accepts `-version` but fails on `--version`. Using one spelling for both
+  // reports one of them missing regardless of which is installed.
+  const found = run(bin, [versionFlag], { stdio: 'ignore' }).status === 0;
   log(`${found ? 'found   ' : 'missing '} ${label}`);
 }
 

@@ -96,15 +96,27 @@ function createWindow() {
     icon: ICON,
     autoHideMenuBar: true,
     webPreferences: {
-      // The renderer is ordinary web content served by our own loopback
-      // server. It gets no Node access and no preload bridge.
+      // The renderer is ordinary web content served by our own loopback server.
+      // It gets no Node access. The preload bridge is the one exception, and it
+      // hands over a single string and nothing else: see below.
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(here, 'preload.cjs'),
     },
   });
 
-  win.loadURL(server.url);
+  // The token goes in the fragment, not the query string.
+  //
+  // A fragment is never sent to the server and never appears in a Referer header,
+  // so the UI can read it without the credential being written into a request log
+  // on its way to our own loopback server. Query parameters would do the same job
+  // and would also work in a browser served over http, at the cost of putting a
+  // full-control credential in every access log between here and there.
+  const url = process.env.BITRATE_AUTH_TOKEN
+    ? `${server.url}/#token=${encodeURIComponent(process.env.BITRATE_AUTH_TOKEN)}`
+    : server.url;
+  win.loadURL(url);
 
   /**
    * Show once the UI has painted, which avoids a white flash on a dark app.
@@ -388,6 +400,12 @@ async function boot() {
     loggerLevel: 'warn',
   });
   log(`server on ${server.url}`);
+  // Stated rather than assumed. A user who has pointed this at a LAN address, or
+  // set a policy that lets it reach private hosts, should be able to see that in
+  // the log without reading the configuration back.
+  const { NETWORK_POLICY, AUTH_TOKEN } = await import('../server/config.js');
+  log(`outbound policy: ${NETWORK_POLICY}`
+    + (AUTH_TOKEN ? ' | api requires a token' : ' | loopback only, no token'));
 
   createWindow();
   installDownloadInterception();

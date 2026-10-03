@@ -77,6 +77,11 @@ export async function initTracing() {
  *
  * `output` may be a value or a function of the step's return value, for when the
  * interesting part of a result is a summary rather than the value itself.
+ *
+ * `onError` is called with whatever `fn` threw, before the error is rethrown. It
+ * exists so a step can be counted without wrapping the whole body in a
+ * try/catch, and so the counting is in the same place as the tracing rather than
+ * in a parallel structure that drifts from it.
  */
 export async function withSpan(name, fn, {
   input,
@@ -85,6 +90,7 @@ export async function withSpan(name, fn, {
   tags,
   asType,
   level,
+  onError,
   env = environment(),
 } = {}) {
   if (!state.enabled) return fn(null);
@@ -122,6 +128,10 @@ export async function withSpan(name, fn, {
         statusMessage: err.message,
         output: { error: err.message },
       });
+      // Reported to the caller first, and its own failure is swallowed: a
+      // counter that throws must not replace the error that was actually worth
+      // reporting.
+      try { onError?.(err); } catch { /* the failure below is the interesting one */ }
       throw err;
     }
   }, { asType: asType || 'span' });

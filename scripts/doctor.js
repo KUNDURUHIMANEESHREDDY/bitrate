@@ -36,3 +36,27 @@ console.log(`  [${fs.existsSync(dist) ? 'ok  ' : 'warn'}] ui        ${fs.existsS
 
 const dl = process.env.BITRATE_DOWNLOAD_DIR || path.join(ROOT, 'downloads');
 console.log(`  [ok  ] downloads ${dl}`);
+
+// The security posture, reported rather than left for the reader to infer from a
+// set of environment variables. A misconfigured instance is the case worth
+// catching here, because nothing else complains about it.
+const { NETWORK_POLICY, HOST, AUTH_TOKEN, MAX_QUEUE_SIZE, MAX_SCRAPE_BYTES } =
+  await import('../server/config.js');
+const { isLoopbackBind } = await import('../server/auth.js');
+
+console.log('\nSecurity posture');
+const policyNote = {
+  lan: 'loopback and private addresses allowed (a NAS or local server is a valid source)',
+  strict: 'public addresses only',
+  open: 'no address filtering',
+}[NETWORK_POLICY];
+const policyWarn = NETWORK_POLICY === 'open' ? 'warn' : 'ok';
+console.log(`  [${policyWarn}] outbound ${NETWORK_POLICY.padEnd(7)} ${policyNote}`);
+
+const loopback = isLoopbackBind(HOST);
+console.log(`  [${loopback || AUTH_TOKEN ? 'ok' : 'FAIL'}] bind      ${HOST}`
+  + (loopback ? ' (loopback only)' : AUTH_TOKEN ? ' (network, token required)' : ' (network, NO TOKEN)'));
+
+if (AUTH_TOKEN) console.log('  [ok  ] token     required on every /api request');
+else console.log('  [ok  ] token     not needed on a loopback bind');
+console.log(`  [ok  ] budgets   queue ${MAX_QUEUE_SIZE}, scrape ${Math.round(MAX_SCRAPE_BYTES / 1048576)}MB`);

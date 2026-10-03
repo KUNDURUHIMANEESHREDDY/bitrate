@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { listJobs, listFiles, health as getHealth } from '../lib/api.js';
+import { listJobs, listFiles, health as getHealth, withToken } from '../lib/api.js';
 
 /**
  * Live server state over SSE.
@@ -35,7 +35,10 @@ export function useServerState() {
 
     const connect = () => {
       if (!alive) return;
-      source = new EventSource('/api/events');
+      // EventSource cannot set a header, so the token goes in the query string.
+      // Without it a configured token silently kills the live job updates and the
+      // UI just sits there looking disconnected.
+      source = new EventSource(withToken('/api/events'));
 
       source.addEventListener('open', () => alive && setConnected(true));
 

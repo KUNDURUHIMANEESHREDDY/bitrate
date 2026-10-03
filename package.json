@@ -19,7 +19,7 @@
     "doctor": "node scripts/doctor.js",
     "idm": "node scripts/idm.js",
     "icon": "node desktop/make-icon.js",
-    "test": "node test/tray-menu.test.mjs && node test/close.test.mjs && node test/engine.test.mjs && node test/ingest-validate.test.mjs && node test/trace.test.mjs && node test/resume.test.mjs",
+    "test": "node test/tray-menu.test.mjs && node test/close.test.mjs && node test/engine.test.mjs && node test/ingest-validate.test.mjs && node test/trace.test.mjs && node test/resume.test.mjs && node test/security.test.mjs && node test/auth.test.mjs && node test/recovery.test.mjs && node test/promote.test.mjs && node test/stress.test.mjs && node test/idm.test.mjs && node test/egress.test.mjs && node test/token.test.mjs && node test/token-live.test.mjs && node test/leak.test.mjs && node test/manifest.test.mjs && node test/cancel.test.mjs && node test/flags.test.mjs",
     "test:trace": "node test/trace-download.test.mjs",
     "test:trace:verify": "node test/trace-verify.mjs",
     "bench:aria2": "node test/bench-aria2.mjs",

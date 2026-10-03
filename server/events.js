@@ -5,11 +5,29 @@
  * slower and noisier than pushing. SSE keeps the connection open over plain
  * HTTP with no extra dependency, and reconnects on its own.
  */
+import { MAX_SSE_CLIENTS } from './config.js';
+
 export class EventHub {
   #clients = new Set();
   #lastId = 0;
+  #max = Infinity;
 
+  constructor({ max = Infinity } = {}) {
+    this.#max = max;
+  }
+
+  /**
+   * Attach a client, or refuse it.
+   *
+   * Returns null when the hub is already at its ceiling. Each stream is a socket
+   * held open for the life of a tab and pinged every 15s, so an unbounded set is
+   * a way to hold a desktop app's resources open indefinitely. A client that gets
+   * refused can reconnect, so this degrades to a lagging progress bar rather than
+   * a failure.
+   */
   addClient(res, { lastEventId = 0 } = {}) {
+    if (this.#clients.size >= this.#max) return null;
+
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache, no-transform',
@@ -27,6 +45,7 @@ export class EventHub {
       if (!client.alive) return;
       try { res.write(': ping\n\n'); } catch { this.#drop(client); }
     }, 15_000);
+    ping.unref?.();
 
     const close = () => {
       clearInterval(ping);
@@ -59,10 +78,11 @@ export class EventHub {
   }
 
   get size() { return this.#clients.size; }
+  get max() { return this.#max; }
 
   closeAll() {
     for (const client of [...this.#clients]) this.#drop(client);
   }
 }
 
-export const hub = new EventHub();
+export const hub = new EventHub({ max: MAX_SSE_CLIENTS });

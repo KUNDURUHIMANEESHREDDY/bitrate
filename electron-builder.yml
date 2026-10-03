@@ -17,6 +17,10 @@ files:
   # The Electron entry point and its modules. Without these the asar has no
   # main script, which electron-builder rejects at the sanity check.
   - desktop/**/*.js
+  # The preload bridge is .cjs, not .js, because a sandboxed preload runs without
+  # Node's module loader and so cannot use ESM. Without this line the packaged app
+  # has a window that cannot authenticate to its own API.
+  - desktop/**/*.cjs
   - desktop/icon.png
   - server/**/*.js
   - scripts/setup.js
